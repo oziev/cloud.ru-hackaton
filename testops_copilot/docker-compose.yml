@@ -1,0 +1,129 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg15
+    container_name: testops_postgres
+    environment:
+      POSTGRES_DB: testops_copilot
+      POSTGRES_USER: testops
+      POSTGRES_PASSWORD: testops_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U testops -d testops_copilot"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - testops_network
+
+  redis:
+    image: redislabs/redisearch:latest
+    container_name: testops_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: >
+      redis-server
+      --appendonly yes
+      --maxmemory 4gb
+      --maxmemory-policy allkeys-lru
+      --loadmodule /usr/lib/redis/modules/redisearch.so
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - testops_network
+
+  api_gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile.api_gateway
+    container_name: testops_api_gateway
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://testops:testops_password@postgres:5432/testops_copilot
+      - REDIS_URL=redis://redis:6379/0
+      - PYTHONPATH=/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - .:/app
+    working_dir: /app
+    command: uvicorn api_gateway.main:app --host 0.0.0.0 --port 8000 --reload
+    networks:
+      - testops_network
+
+  celery_worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    container_name: testops_celery_worker
+    environment:
+      - DATABASE_URL=postgresql://testops:testops_password@postgres:5432/testops_copilot
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/1
+      - PYTHONPATH=/app
+    depends_on:
+      - postgres
+      - redis
+    volumes:
+      - .:/app
+    working_dir: /app
+    command: celery -A workers.celery_app worker --loglevel=info --concurrency=4
+    networks:
+      - testops_network
+
+  flower:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    container_name: testops_flower
+    ports:
+      - "5555:5555"
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/1
+      - PYTHONPATH=/app
+    depends_on:
+      - redis
+      - celery_worker
+    volumes:
+      - .:/app
+    working_dir: /app
+    command: celery -A workers.celery_app flower --port=5555
+    networks:
+      - testops_network
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: testops_frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      - api_gateway
+    networks:
+      - testops_network
+    restart: unless-stopped
+
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  testops_network:
+    driver: bridge
+
